@@ -1,0 +1,569 @@
+/* ═══════════════════════════════════════════════════════════════
+   NW DIGITALS COMMAND CENTER — PIPELINE v2
+   Flow: 1 New Lead → 2 Permission Asked (ask for a call)
+         → 3 Call Scheduled (proper breakdown call)
+         → 4 Proposal Sent → 5 WON / LOST / Archive
+   ═══════════════════════════════════════════════════════════════ */
+const PIPE_VERSION='nw_pipeline_v2';
+const STAGES=[
+  {key:'New Lead',         n:1, title:'New Lead',         hint:'Researched, not contacted yet',        action:'Send permission ask',                 days:0, next:'Permission Asked', cls:'status-new'},
+  {key:'Permission Asked', n:2, title:'Permission Asked', hint:'Asked: can we jump on a quick call?',  action:'Follow up — ask for a quick call',    days:1, next:'Call Scheduled',   cls:'status-perm'},
+  {key:'Call Scheduled',   n:3, title:'Call Scheduled',   hint:'Proper call booked — full breakdown',  action:'Hold breakdown call (set date & time)',days:2, next:'Proposal Sent',    cls:'status-call'},
+  {key:'Proposal Sent',    n:4, title:'Proposal Sent',    hint:'Written proposal out — follow up',     action:'Follow up on proposal',               days:2, next:'WON',              cls:'status-prop'}
+];
+const ALL_STATUS=['New Lead','Permission Asked','Call Scheduled','Proposal Sent','WON','LOST','Archive'];
+const CLOSED=['WON','LOST','Archive'];
+const STAGE_INDEX={'New Lead':0,'Permission Asked':1,'Call Scheduled':2,'Proposal Sent':3,'WON':3};
+const STATUS_CLS={'New Lead':'status-new','Permission Asked':'status-perm','Call Scheduled':'status-call','Proposal Sent':'status-prop','WON':'status-won','LOST':'status-lost','Archive':'status-arch'};
+const isOpen=l=>!CLOSED.includes(l.status);
+
+/* ── Data hygiene: migrate old statuses, purge untouched sample leads ── */
+function normalizeLead(l){
+  if(!l||typeof l!=='object')return null;
+  let st=String(l.status||'New Lead').replace(/\s*✅\s*$/,'').trim();
+  if(st==='Audit Sent')st='Permission Asked';          // audit step retired
+  if(!ALL_STATUS.includes(st))st='New Lead';
+  l.status=st;
+  if(l.priority==='COLD')l.priority='NURTURE';         // modal used COLD, filters used NURTURE
+  if(!['HOT','WARM','NURTURE'].includes(l.priority))l.priority='WARM';
+  l.business=String(l.business||'Unnamed lead');
+  l.niche=String(l.niche||'General');
+  l.city=String(l.city||'North West');
+  l.phone=String(l.phone||'—');
+  l.leak=String(l.leak||'');
+  l.website=String(l.website||'');
+  l.contact=String(l.contact||'');
+  l.notes=String(l.notes||'');
+  l.nextAction=String(l.nextAction||'');
+  l.nextDate=String(l.nextDate||'');
+  l.revenue=parseInt(l.revenue)||0;
+  l.lastContact=String(l.lastContact||'');
+  if(typeof l.reached!=='number'){
+    l.reached=STAGE_INDEX[st]!==undefined?STAGE_INDEX[st]:0;
+  }
+  if(st==='WON')l.reached=Math.max(l.reached,3);
+  return l;
+}
+function isUntouchedSample(l){
+  // seeded "ranked 1→100" rows carried a rank field; drop them only if never worked
+  return l.rank!==undefined && l.status==='New Lead' && !l.revenue && !l.notes && !l.contact;
+}
+function normalizeLeads(arr){
+  if(!Array.isArray(arr))return [];
+  return arr.map(normalizeLead).filter(Boolean).filter(l=>!isUntouchedSample(l));
+}
+function normalizeDaily(arr){
+  if(!Array.isArray(arr))return [];
+  return arr.filter(d=>d&&d.date);
+}
+function readJSON(key,fallback){try{const v=JSON.parse(localStorage.getItem(key)||'null');return v===null?fallback:v}catch(e){return fallback}}
+
+let leads=readJSON('nw_leads',[]);
+let daily=readJSON('nw_daily',[]);
+(function migrate(){
+  const before=Array.isArray(leads)?leads.length:0;
+  leads=normalizeLeads(leads); daily=normalizeDaily(daily);
+  if(localStorage.getItem('nw_pipeline_version')!==PIPE_VERSION){
+    const removed=before-leads.length;
+    localStorage.setItem('nw_leads_reset_at',String(Date.now())); // stale pushes from old app versions are ignored
+    localStorage.setItem('nw_pipeline_version',PIPE_VERSION);
+    localStorage.removeItem('nw_outreach_launch_v2');
+    localStorage.setItem('nw_leads',JSON.stringify(leads));
+    localStorage.setItem('nw_daily',JSON.stringify(daily));
+    window.__migrationNote=removed>0?`Pipeline v2 — removed ${removed} untouched sample leads`:'';
+  }
+})();
+
+/* ── Quick Replies — mapped to the 5 steps ── */
+const quickReplies=[
+  {key:'/permission',step:'Step 2',title:'Permission Ask — can we jump on a call?',
+   text:"Dumela [Name]! It's [Your Name] from NW Digitals here in North West. 👋\n\nI came across [BUSINESS] while looking at [NICHE] in [CITY] and spotted something on your online presence that could be costing you enquiries.\n\nDo you mind if we jump on a quick 5-minute call so I can tell you what I found? No obligation."},
+  {key:'/follow1',step:'Step 2',title:'Follow-Up #1 — no reply after 24h',
+   text:"Hey [Name], just following up on my message about [BUSINESS]. 🙂\n\nWould a quick 5-minute call this week work? Give me a time that suits you and I'll call you."},
+  {key:'/book',step:'Step 3',title:'Book the proper call — they said YES',
+   text:"Sharp, thanks [Name]! 🙌\n\nLet's lock in a proper time so I can walk you through everything I found for [BUSINESS] and exactly how we'd fix it — it takes about [20–30] minutes.\n\nWhat works for you: [DAY/TIME 1] or [DAY/TIME 2]?"},
+  {key:'/confirm',step:'Step 3',title:'Call confirmation — day before',
+   text:"Hi [Name], confirming our call tomorrow at [TIME] about [BUSINESS]. 👍\n\nI'll show you what I found and the plan to fix it. If anything changes, just shout and we'll move it."},
+  {key:'/proposal',step:'Step 4',title:'Proposal Delivery — after the call',
+   text:"Thanks for your time on the call, [Name]. Here's the written proposal for [BUSINESS], as discussed:\n\n📄 [ATTACH PROPOSAL PDF]\n\nIt covers scope, timeline and investment. I'll check in on [DAY] — and if you want to go through any part of it, just say."},
+  {key:'/follow2',step:'Step 4',title:'Proposal follow-up / breakup',
+   text:"Hey [Name], no pressure at all if now isn't the right time. I'll close the file on [BUSINESS] for now and keep your notes in case you need them later.\n\nBefore I do — is this something you still want to fix this quarter, or should I check back in [MONTH]?"},
+  {key:'/price',step:'Step 3–4',title:'Price question — answer on the call, not in text',
+   text:"Fair question, [Name]. Rather than throw a number at you in a message, let me show you exactly what's included and what one extra enquiry is worth to [BUSINESS] — then the investment makes sense in context.\n\nCan we take 10 minutes on a call? [DAY/TIME]"},
+  {key:'/won',step:'Step 5',title:'WON — welcome & next steps',
+   text:"Welcome aboard, [Name]! 🎉 Really glad to be building this with you.\n\nNext steps:\n1️⃣ [DEPOSIT / PAYMENT STEP]\n2️⃣ I'll send the content checklist (logo, photos, services, contact details)\n3️⃣ Kick-off date: [DATE]\n\nAny questions, WhatsApp me directly."}
+];
+const CALL_AGENDA=[
+  ['Their world','How do enquiries reach them today? What is one good customer worth? What have they tried?'],
+  ['What I found','Show the leak on screen — site, Google profile, WhatsApp path. Facts only.'],
+  ['What it costs them','Translate the leak into enquiries and rands using THEIR numbers, not mine.'],
+  ['The fix','Scope, what is included, timeline — in plain language.'],
+  ['Investment & terms','Price, deposit, what they own, what happens after launch.'],
+  ['Close the call','Agree the next step out loud: "I\'ll send the written proposal by [time]." Then move them to Proposal Sent.']
+];
+
+/* ── Helpers ── */
+function localISODate(date=new Date()){
+  const y=date.getFullYear(),m=String(date.getMonth()+1).padStart(2,'0'),d=String(date.getDate()).padStart(2,'0');
+  return `${y}-${m}-${d}`;
+}
+function datePlusDaysISO(days){const d=new Date();d.setHours(12,0,0,0);d.setDate(d.getDate()+days);return localISODate(d)}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function save(){localStorage.setItem('nw_leads',JSON.stringify(leads));localStorage.setItem('nw_daily',JSON.stringify(daily));updateStats()}
+function getMyName(){return (localStorage.getItem('nw_my_name')||'').trim()}
+function cityShort(l){return String(l.city||'').split('•')[0].trim()}
+function greetName(l){return (l.contact||'').trim().split(' ')[0]||'there'}
+function stageOf(l){return STAGES.find(s=>s.key===l.status)}
+function safeUrl(u){u=String(u||'').trim();if(!u)return'';if(!/^https?:\/\//i.test(u))u='https://'+u;try{return new URL(u).href}catch(e){return''}}
+function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u}}
+
+/* ── Outreach scheduling (10 asks today, then 5 a day) ── */
+function applyOutreachSchedule(items){
+  const pr={HOT:0,WARM:1,NURTURE:2};
+  items.sort((a,b)=>(pr[a.priority]??9)-(pr[b.priority]??9)||a.id-b.id);
+  items.forEach((lead,i)=>{lead.nextDate=datePlusDaysISO(i<10?0:1+Math.floor((i-10)/5))});
+  localStorage.setItem('nw_leads',JSON.stringify(leads));
+  return items.length;
+}
+function startOutreachToday(){
+  const pending=leads.filter(l=>l.status==='New Lead');
+  if(!pending.length){toast('No New Leads to schedule');return}
+  if(!confirm(`Schedule ${pending.length} New Leads from today? First 10 are due today, then 5 per day.`))return;
+  const count=applyOutreachSchedule(pending);
+  save();renderLeads();renderFollowups();switchTab('followups');
+  toast(`🚀 ${Math.min(10,count)} due today • ${count} scheduled`);
+}
+
+/* ── Stats ── */
+const reachedAtLeast=(l,n)=>l.status==='WON'?true:(l.reached>=n&&n<=3);
+function computeFunnel(){
+  const everyone=leads;                                   // every lead ever added (incl. archived)
+  const c=[
+    everyone.length,
+    everyone.filter(l=>l.reached>=1||l.status==='WON').length,
+    everyone.filter(l=>l.reached>=2||l.status==='WON').length,
+    everyone.filter(l=>l.reached>=3||l.status==='WON').length,
+    everyone.filter(l=>l.status==='WON').length
+  ];
+  return c;
+}
+function updateStats(){
+  const open=leads.filter(isOpen);
+  const hot=open.filter(l=>l.priority==='HOT').length;
+  const warm=open.filter(l=>l.priority==='WARM').length;
+  const nurture=open.filter(l=>l.priority==='NURTURE').length;
+  const total=leads.filter(l=>l.status!=='Archive').length;
+  const f=computeFunnel();
+  const booked=f[2], props=f[3], won=f[4];
+  const lost=leads.filter(l=>l.status==='LOST').length;
+  const revenue=leads.filter(l=>l.status==='WON').reduce((s,l)=>s+(parseInt(l.revenue)||0),0);
+  const sumAsks=daily.reduce((s,d)=>s+(parseInt(d.asks)||0),0);
+  const sumReplies=daily.reduce((s,d)=>s+(parseInt(d.replies)||0),0);
+  const sumHeld=daily.reduce((s,d)=>s+(parseInt(d.held)||0),0);
+  const replyRate=sumAsks?Math.round(sumReplies/sumAsks*100):0;
+  const closeRate=props?Math.round(won/props*100):0;
+  const avg=won?Math.round(revenue/won):0;
+  const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v};
+  const lc=document.getElementById('leadCommandTitle'); if(lc) lc.innerHTML=`LEAD COMMAND — ${open.length} IN PIPELINE <em>TAP WHATSAPP TO CHAT</em>`;
+  set('statHot',hot); set('statTotal',total);
+  set('priorityBreakdown',`WARM ${warm} • NURTURE ${nurture}`);
+  set('statBooked',booked); set('statProposals',props); set('statWon',won);
+  set('statRevenue','R'+revenue.toLocaleString());
+  set('statWonSub',closeRate+'% of proposals • '+lost+' lost');
+  set('statAvg','Avg R'+avg.toLocaleString());
+  set('tabLeadsCount',total);
+  const today=localISODate();
+  const followCount=open.filter(l=>l.nextDate).length;
+  set('tabFollowCount',followCount);
+  const bb=document.getElementById('bnavFollowBadge');
+  if(bb){bb.textContent=followCount;bb.style.display=followCount>0?'block':'none'}
+  set('nextDueCount',open.filter(l=>l.nextDate&&l.nextDate<=today).length+' due today');
+  set('mTotal',total); set('mAsks',sumAsks); set('mReplies',sumReplies);
+  set('mReplyRate',replyRate+'% reply rate');
+  set('mBooked',booked); set('mHeld',sumHeld); set('mProps',props);
+  set('mDeals',won); set('mCloseRate',closeRate+'% close rate');
+  set('mRevenue','R'+revenue.toLocaleString()); set('mAvg','Avg R'+avg.toLocaleString());
+  set('todayText',new Date().toLocaleDateString('en-ZA',{weekday:'short',day:'numeric',month:'short',year:'numeric'}));
+  renderPipeline(); renderFunnel(f,lost);
+}
+function renderPipeline(){
+  const el=document.getElementById('pipeline'); if(!el)return;
+  const cur=(document.getElementById('filterStatus')||{}).value||'all';
+  const cnt=k=>leads.filter(l=>l.status===k).length;
+  const stageBtn=s=>`<button class="stage ${cur===s.key?'active':''}" data-st="${s.key}" type="button">
+      <span class="sn">${s.n}</span><span class="st">${s.title}</span><span class="sc">${cnt(s.key)}</span>
+      <span class="sh">${s.hint}</span></button>`;
+  const closeActive=['WON','LOST','Archive'].includes(cur)?'active':'';
+  el.innerHTML=STAGES.map(stageBtn).join('')+`
+    <div class="stage close ${closeActive}">
+      <span class="sn">5</span><span class="st">Close out</span><span class="sc">${cnt('WON')+cnt('LOST')+cnt('Archive')}</span>
+      <span class="sh sh-close">
+        <button type="button" class="mini won ${cur==='WON'?'on':''}" data-st="WON">WON ${cnt('WON')}</button>
+        <button type="button" class="mini lost ${cur==='LOST'?'on':''}" data-st="LOST">LOST ${cnt('LOST')}</button>
+        <button type="button" class="mini ${cur==='Archive'?'on':''}" data-st="Archive">ARCHIVE ${cnt('Archive')}</button>
+      </span></div>`;
+}
+function renderFunnel(f,lost){
+  const el=document.getElementById('funnel'); if(!el)return;
+  const labels=['1 · New Leads added','2 · Permission asked','3 · Call scheduled','4 · Proposal sent','5 · WON'];
+  const base=Math.max(f[0],1);
+  el.innerHTML=f.map((n,i)=>{
+    const prev=i===0?null:f[i-1];
+    const conv=i===0?'':(prev?Math.round(n/prev*100)+'% of previous':'—');
+    return `<div class="fn-row"><div class="fn-label">${labels[i]}</div>
+      <div class="fn-bar"><span style="width:${Math.round(n/base*100)}%"></span></div>
+      <div class="fn-num"><b>${n}</b><small>${conv}</small></div></div>`;
+  }).join('')+`<div class="fn-foot">Lost: <b>${lost}</b> • Counts are "ever reached", so a lead that was lost after a proposal still counts as a proposal sent.</div>`;
+}
+
+/* ── WhatsApp ── */
+function waLink(p){if(!p)return'';const d=String(p).replace(/[^0-9]/g,'');if(!d)return'';if(d.length===10&&d.startsWith('0'))return'27'+d.slice(1);if(d.startsWith('27'))return d;if(d.length>=9)return d;return''}
+function waMessage(l){
+  const g=greetName(l), me=getMyName()||'[Your Name]', biz=l.business;
+  const niche=l.niche&&l.niche!=='General'?` while looking at ${l.niche}`:'';
+  const city=cityShort(l)?` in ${cityShort(l)}`:'';
+  switch(l.status){
+    case 'New Lead': return `Dumela ${g}! It's ${me} from NW Digitals here in North West. 👋\n\nI came across ${biz}${niche}${city} and spotted something on your online presence that could be costing you enquiries.\n\nDo you mind if we jump on a quick 5-minute call so I can tell you what I found? No obligation.`;
+    case 'Permission Asked': return `Hey ${g}, just following up on my message about ${biz}. 🙂\n\nWould a quick 5-minute call this week work? Give me a time that suits you and I'll call you.`;
+    case 'Call Scheduled': return `Hi ${g}, confirming our call about ${biz}. I'll walk you through everything I found and exactly how we'd fix it. Still good for the time we agreed? 👍`;
+    case 'Proposal Sent': return `Hi ${g}, just checking the proposal for ${biz} came through clearly. Happy to go through any part of it — what questions do you have?`;
+    default: return `Hi ${g}, it's ${me} from NW Digitals.`;
+  }
+}
+function waHrefForLead(l){const wa=waLink(l.phone);if(!wa||wa.length<9)return'';return `https://wa.me/${wa}?text=${encodeURIComponent(waMessage(l))}`}
+function hasWhatsApp(l){const p=String(l.phone||'');return waLink(p).length>=9&&!p.includes('Facebook')&&!p.includes('—')}
+document.addEventListener('click',e=>{
+  const a=e.target.closest&&e.target.closest('a[data-wa]'); if(!a||getMyName())return;
+  e.preventDefault();
+  const n=prompt('Your first name for WhatsApp messages? (saved on this device — so messages never go out with "[Your Name]")');
+  if(n&&n.trim()){localStorage.setItem('nw_my_name',n.trim());renderLeads();toast('Saved — tap WhatsApp again')}
+  else{window.open(a.href,'_blank','noopener')}
+});
+
+/* ── Render: Leads ── */
+const PRIO_RANK={HOT:0,WARM:1,NURTURE:2};
+function statusSelect(l,full){
+  const opts=ALL_STATUS.map(s=>`<option value="${s}" ${l.status===s?'selected':''}>${s==='WON'?'WON ✅':s}</option>`).join('');
+  return `<select class="status-select ${STATUS_CLS[l.status]||''}" ${full?'style="width:100%;padding:10px;font-size:13px"':''} onchange="updateStatus(${l.id},this.value)">${opts}</select>`;
+}
+function siteCell(l){const u=safeUrl(l.website);return u?`<a href="${esc(u)}" target="_blank" rel="noopener" style="font-size:11px;color:#7DD3FC;overflow-wrap:anywhere">${esc(hostOf(u))}</a>`:`<span style="font-size:11px;color:var(--dim)">— no site</span>`}
+function emptyBlock(){
+  return `<div class="empty-pipe"><div style="font-size:30px">🎯</div>
+    <div class="ep-title">No leads yet — your pipeline is clean</div>
+    <div class="ep-sub">Add a lead and run the 5 steps: <b>New Lead → Permission Asked → Call Scheduled → Proposal Sent → WON / LOST / Archive</b></div>
+    <button class="btn btn-primary" style="margin-top:14px" onclick="openAddLead()">+ New Lead</button></div>`;
+}
+function renderLeads(){
+  const q=document.getElementById('searchInput').value.toLowerCase();
+  const pr=document.getElementById('filterPriority').value;
+  const st=document.getElementById('filterStatus').value;
+  const tbody=document.getElementById('leadsBody');
+  tbody.innerHTML='';
+  const today=localISODate();
+  let f=leads.filter(l=>{
+    if(q&&![l.business,l.city,l.niche,l.leak,l.website,l.contact,l.phone,l.notes].join(' ').toLowerCase().includes(q))return false;
+    if(pr!=='all'&&l.priority!==pr)return false;
+    if(st==='all'&&l.status==='Archive')return false;     // archive hidden from the main view
+    if(st!=='all'&&l.status!==st)return false;
+    return true;
+  });
+  f.sort((a,b)=>(PRIO_RANK[a.priority]??9)-(PRIO_RANK[b.priority]??9)||a.id-b.id);
+  f.forEach(l=>{
+    const tr=document.createElement('tr'); if(l.priority==='HOT'&&isOpen(l))tr.className='hot-row';
+    const waHref=waHrefForLead(l), hasWA=hasWhatsApp(l);
+    const nextCls=l.nextDate&&isOpen(l)?(l.nextDate<today?'overdue-date':l.nextDate===today?'due-today':''):'';
+    tr.innerHTML=`
+      <td><strong style="color:#fff">#${String(l.id).padStart(2,'0')}</strong></td>
+      <td><div style="font-weight:900;font-size:12px;overflow-wrap:anywhere">${esc(l.business)}</div><div style="font-size:10px;color:var(--muted);overflow-wrap:anywhere">${esc(l.niche)}${l.contact?' • '+esc(l.contact):''}</div></td>
+      <td><div style="font-weight:800;overflow-wrap:anywhere">${esc(l.city)}</div><div style="font-size:10px;color:var(--dim);overflow-wrap:anywhere">${esc(l.phone)}</div></td>
+      <td>${hasWA?`<a class="btn-wa" data-wa="${l.id}" href="${waHref}" target="_blank" rel="noopener">💬 WhatsApp</a>`:`<span style="font-size:11px;color:var(--dim);overflow-wrap:anywhere">${esc(l.phone)}</span>`}</td>
+      <td>${siteCell(l)}</td>
+      <td>${l.leak?`<span class="leak-chip">${esc(l.leak)}</span>`:'<span style="font-size:11px;color:var(--dim)">—</span>'}</td>
+      <td><span class="pill ${l.priority==='HOT'?'pill-hot':l.priority==='WARM'?'pill-warm':'pill-cold'}">${esc(l.priority)}</span></td>
+      <td>${statusSelect(l,false)}</td>
+      <td><input value="${esc(l.nextAction)}" class="inline-input" onchange="updateField(${l.id},'nextAction',this.value)"></td>
+      <td><input type="date" value="${esc(l.nextDate)}" class="next-date ${nextCls}" onchange="updateField(${l.id},'nextDate',this.value)"></td>
+      <td><input type="number" value="${l.revenue||''}" placeholder="0" title="Counts in Revenue once the lead is WON" class="rev-input" onchange="updateField(${l.id},'revenue',this.value)"></td>
+      <td style="display:flex;gap:6px"><button class="icon-btn" title="Call brief & notes" onclick="viewCall(${l.id})">📄</button><button class="icon-btn" title="Proposal" onclick="viewProposal(${l.id})">💰</button><button class="icon-btn" title="Delete" onclick="deleteLead(${l.id})">🗑</button></td>`;
+    tbody.appendChild(tr);
+  });
+  if(!f.length){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td colspan="12" style="padding:0">${leads.length?`<div class="empty-pipe"><div style="font-size:26px">🔍</div><div class="ep-title">No leads match</div><div class="ep-sub">Try Reset filters</div></div>`:emptyBlock()}</td>`;
+    tbody.appendChild(tr);
+  }
+  const mCards=document.getElementById('leadsCards');
+  if(mCards){
+    mCards.innerHTML='';
+    f.forEach(l=>{
+      const waHref=waHrefForLead(l), hasWA=hasWhatsApp(l);
+      const nextCls=l.nextDate&&isOpen(l)?(l.nextDate<today?'overdue-date':l.nextDate===today?'due-today':''):'';
+      const prioCls=l.priority==='HOT'?'hot':l.priority==='WARM'?'warm':'';
+      const card=document.createElement('div');
+      card.className='lead-card '+prioCls;
+      card.innerHTML=`
+        <div class="lead-card-head">
+          <span class="lead-card-num">#${String(l.id).padStart(2,'0')} • ${esc(l.priority)}</span>
+          <span class="pill ${l.priority==='HOT'?'pill-hot':l.priority==='WARM'?'pill-warm':'pill-cold'}">${esc(l.priority)}</span>
+        </div>
+        <div class="lead-card-title"><h4>${esc(l.business)}</h4><p>${esc(l.niche)} • ${esc(l.city)}${l.contact?' • '+esc(l.contact):''}</p></div>
+        <div class="lead-card-meta">
+          <div><label>Phone</label><span>${esc(l.phone)}</span></div>
+          <div><label>Site</label><span>${siteCell(l)}</span></div>
+          <div><label>Status</label><span>${esc(l.status)}</span></div>
+          <div><label>Next Date</label><span style="${nextCls?'color:'+(nextCls==='overdue-date'?'#FCA5A5':'#FDE68A')+';font-weight:800':''}">${esc(l.nextDate)||'—'}</span></div>
+        </div>
+        ${l.leak?`<div class="lead-card-leak">⚠ ${esc(l.leak)}</div>`:''}
+        <div class="lead-card-actions">
+          ${hasWA?`<a class="btn-wa" data-wa="${l.id}" href="${waHref}" target="_blank" rel="noopener">💬 WhatsApp — ${esc(l.phone)}</a>`:`<div style="background:#0A1430;border:1px solid var(--line);padding:10px;border-radius:10px;text-align:center;font-size:12px;color:var(--muted)">No WhatsApp number</div>`}
+          ${statusSelect(l,true)}
+          <div class="lead-card-row">
+            <div class="field"><label>Next Action</label><input value="${esc(l.nextAction)}" class="card-input" onchange="updateField(${l.id},'nextAction',this.value)"></div>
+            <div class="field"><label>Revenue (R)</label><input type="number" value="${l.revenue||''}" placeholder="0" class="card-input" onchange="updateField(${l.id},'revenue',this.value)"></div>
+          </div>
+          <div class="lead-card-row">
+            <div class="field"><label>Next Date</label><input type="date" value="${esc(l.nextDate)}" class="next-date ${nextCls}" style="width:100%;padding:9px;background:#060D1F" onchange="updateField(${l.id},'nextDate',this.value)"></div>
+            <div class="field"><label>Quick</label><div style="display:flex;gap:6px"><button class="icon-btn" style="flex:1;height:38px" onclick="viewCall(${l.id})" title="Call brief">📄 Brief</button><button class="icon-btn" style="flex:1;height:38px" onclick="viewProposal(${l.id})" title="Proposal">💰 Prop</button></div></div>
+          </div>
+        </div>
+        <div class="lead-card-footer"><button class="icon-btn" onclick="deleteLead(${l.id})" title="Delete">🗑</button></div>`;
+      mCards.appendChild(card);
+    });
+    if(!f.length) mCards.innerHTML=leads.length?`<div class="empty-pipe"><div style="font-size:26px">🔍</div><div class="ep-title">No leads match</div><div class="ep-sub">Try Reset filters</div></div>`:emptyBlock();
+  }
+  document.getElementById('leadsShowing').textContent='Showing '+f.length+' of '+leads.length;
+  renderPipeline();
+  renderFollowups();
+}
+
+/* ── Status transitions ── */
+function updateStatus(id,val){
+  const l=leads.find(x=>x.id===id); if(!l)return;
+  val=String(val).replace(/\s*✅\s*$/,'').trim();
+  if(!ALL_STATUS.includes(val)){renderLeads();return}
+  l.status=val; l.lastContact=localISODate();
+  const idx=STAGE_INDEX[val]; if(idx!==undefined) l.reached=Math.max(l.reached||0,idx);
+  const stg=STAGES.find(s=>s.key===val);
+  if(stg){l.nextAction=stg.action; l.nextDate=datePlusDaysISO(stg.days)}
+  if(val==='Call Scheduled') toast('📞 Call booked — set the exact date in Next Date');
+  if(val==='WON'){
+    l.nextDate=''; l.nextAction='Onboard client — deposit + content checklist';
+    if(!l.revenue){
+      const v=prompt('Deal value in Rand? (numbers only — leave blank to enter later)','');
+      const n=parseInt(String(v||'').replace(/[^0-9]/g,''));
+      if(n>0) l.revenue=n;
+    }
+  }
+  if(val==='LOST'){
+    l.nextDate=''; l.nextAction='';
+    const why=prompt('Why was it lost? (optional — helps you spot patterns)','');
+    if(why&&why.trim()) l.lostReason=why.trim();
+  }
+  if(val==='Archive'){l.nextDate=''; l.nextAction=''}
+  save(); renderLeads();
+  toast(`${l.business.split(' —')[0]} → ${val}`);
+}
+function advance(id){
+  const l=leads.find(x=>x.id===id); if(!l)return;
+  const s=stageOf(l); if(s) updateStatus(id,s.next);
+}
+function updateField(id,field,val){
+  const l=leads.find(x=>x.id===id); if(!l)return;
+  l[field]=field==='revenue'?(parseInt(val)||0):val;
+  save(); renderFollowups(); updateStats();
+  if(['nextDate','nextAction','revenue'].includes(field)) toast('Updated '+field);
+}
+function deleteLead(id){const l=leads.find(x=>x.id===id);if(!l)return;if(confirm('Delete '+l.business+'? (To keep the history, move it to Archive instead.)')){leads=leads.filter(x=>x.id!==id);save();renderLeads();toast('Deleted')}}
+function resetFilters(){document.getElementById('searchInput').value='';document.getElementById('filterPriority').value='all';document.getElementById('filterStatus').value='all';renderLeads();toast('Filters reset')}
+function setStatusFilter(v){const sel=document.getElementById('filterStatus');sel.value=(sel.value===v)?'all':v;renderLeads()}
+
+/* ── Follow-up queue ── */
+function renderFollowups(){
+  const grid=document.getElementById('followGrid'),empty=document.getElementById('followEmpty');
+  const today=localISODate();
+  let items=leads.filter(l=>l.nextDate&&isOpen(l)); items.sort((a,b)=>a.nextDate.localeCompare(b.nextDate));
+  grid.innerHTML='';
+  if(!items.length){empty.classList.remove('hidden');grid.classList.add('hidden');return}
+  empty.classList.add('hidden');grid.classList.remove('hidden');
+  items.forEach(l=>{
+    const overdue=l.nextDate<today,due=l.nextDate===today,cls=overdue?'overdue':due?'due':'future';
+    const label=overdue?'🔴 OVERDUE':due?'🟡 DUE TODAY':'🟢 '+l.nextDate;
+    const waHref=waHrefForLead(l),hasWA=hasWhatsApp(l),stg=stageOf(l);
+    const d=document.createElement('div');d.className='follow-card '+cls;
+    d.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;min-width:0">
+        <span style="font-size:10px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere;flex:1;min-width:0">#${String(l.id).padStart(2,'0')} • ${esc(l.priority)} • ${stg?'STEP '+stg.n+' · ':''}${esc(l.status)}</span>
+        <span style="font-size:10px;font-weight:800;color:${overdue?'#FCA5A5':due?'#FDE68A':'#86EFAC'};white-space:nowrap;flex-shrink:0">${label}</span>
+      </div>
+      <h4>${esc(l.business)}</h4>
+      <p>${esc(cityShort(l)||l.city)} • ${esc(l.niche)}${l.leak?' • '+esc(l.leak):''}</p>
+      <div class="meta"><span>📞 ${esc(l.phone)}</span><span>→ ${esc(l.nextAction)}</span></div>
+      <div class="follow-card-actions">
+        ${hasWA?`<a class="btn-wa" data-wa="${l.id}" href="${waHref}" target="_blank" rel="noopener">💬 WhatsApp</a>`:''}
+        ${stg?`<button class="btn-sm primary" onclick="advance(${l.id})">${stg.next==='WON'?'Mark WON ✅':'→ '+stg.next}</button>`:''}
+        <button class="btn-sm" onclick="updateStatus(${l.id},'LOST')">Lost</button>
+        <input type="date" value="${esc(l.nextDate)}" class="next-date" style="flex:1;min-width:120px" onchange="updateField(${l.id},'nextDate',this.value)">
+      </div>`;
+    grid.appendChild(d);
+  });
+}
+
+/* ── Daily activity ── */
+function renderDaily(){
+  const tbody=document.getElementById('dailyBody'),cards=document.getElementById('dailyCards');
+  tbody.innerHTML='';cards.innerHTML='';
+  let sumAsks=0,sumReplies=0,sumDeals=0,sumRev=0;
+  daily.forEach(d=>{sumAsks+=parseInt(d.asks)||0;sumReplies+=parseInt(d.replies)||0;sumDeals+=parseInt(d.deals)||0;sumRev+=parseInt(d.revenue)||0});
+  if(!daily.length){
+    tbody.innerHTML=`<tr><td colspan="9" style="text-align:center;padding:18px;color:var(--muted)">No entries yet — log tonight at 20:00</td></tr>`;
+    cards.innerHTML=`<div style="background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;text-align:center;color:var(--muted)"><div style="font-size:28px">📝</div><div style="font-weight:800;color:var(--text);margin-top:6px">No entries yet</div><div style="font-size:11px">Log tonight at 20:00</div></div>`;
+  }else{
+    daily.slice().reverse().forEach((d,revIdx)=>{
+      const idx=daily.length-1-revIdx, rev=(parseInt(d.revenue)||0).toLocaleString();
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td style="font-weight:700;white-space:nowrap">${esc(d.date)}</td><td>${d.asks||0}</td><td>${d.replies||0}</td><td>${d.calls||0}</td><td>${d.held||0}</td><td>${d.props||0}</td><td>${d.deals||0}</td><td style="color:#86EFAC;font-weight:800">R${rev}</td><td><button class="icon-btn" onclick="deleteDaily(${idx})" title="Delete">🗑</button></td>`;
+      tbody.appendChild(tr);
+      const c=document.createElement('div');c.className='daily-card';
+      c.innerHTML=`
+        <div style="min-width:0">
+          <div class="daily-card-date">📅 ${esc(d.date)}</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px;overflow-wrap:anywhere">${esc(d.notes||'— no notes —')}</div>
+          <div class="daily-card-grid">
+            <div class="daily-card-stat"><b>${d.asks||0}</b><span>Asks</span></div>
+            <div class="daily-card-stat"><b>${d.replies||0}</b><span>Replies</span></div>
+            <div class="daily-card-stat"><b>${d.calls||0}</b><span>Booked</span></div>
+            <div class="daily-card-stat"><b>${d.held||0}</b><span>Held</span></div>
+            <div class="daily-card-stat"><b>${d.props||0}</b><span>Props</span></div>
+            <div class="daily-card-stat"><b>${d.deals||0}</b><span>Deals</span></div>
+            <div class="daily-card-stat" style="grid-column:span 2"><b style="color:#86EFAC">R${rev}</b><span>Revenue</span></div>
+          </div>
+        </div>
+        <button class="icon-btn" style="align-self:start" onclick="deleteDaily(${idx})" title="Delete">🗑</button>`;
+      cards.appendChild(c);
+    });
+  }
+  document.getElementById('sumAsks').textContent=sumAsks;
+  document.getElementById('sumDeals').textContent=sumDeals;
+  document.getElementById('sumRevenue').textContent='R'+sumRev.toLocaleString();
+  document.getElementById('dailyCount').textContent=daily.length+' entries';
+  document.getElementById('sumReplyRate').textContent=(sumAsks?Math.round(sumReplies/sumAsks*100):0)+'%';
+  if(!document.getElementById('dailyDate').value) document.getElementById('dailyDate').valueAsDate=new Date();
+}
+const DAILY_FIELDS={asks:'dailyAsks',replies:'dailyReplies',calls:'dailyCalls',held:'dailyHeld',props:'dailyProps',deals:'dailyDeals',revenue:'dailyRevenue'};
+function saveDaily(){
+  const date=document.getElementById('dailyDate').value||localISODate();
+  const entry={date,notes:document.getElementById('dailyNotes').value.trim()};
+  Object.entries(DAILY_FIELDS).forEach(([k,id])=>{entry[k]=document.getElementById(id).value||0});
+  const ex=daily.findIndex(d=>d.date===entry.date); if(ex>=0)daily[ex]=entry; else daily.push(entry);
+  daily.sort((a,b)=>a.date.localeCompare(b.date)); save(); renderDaily(); updateStats();
+  Object.values(DAILY_FIELDS).concat('dailyNotes').forEach(id=>document.getElementById(id).value='');
+  document.getElementById('dailyDate').valueAsDate=new Date(); toast('✅ Saved for '+entry.date);
+}
+function deleteDaily(idx){if(confirm('Delete entry for '+daily[idx].date+'?')){daily.splice(idx,1);save();renderDaily();updateStats();toast('Deleted')}}
+function clearDaily(){if(!daily.length){toast('Nothing to clear');return} if(confirm('Clear all daily history?')){daily=[];save();renderDaily();updateStats();toast('Cleared')}}
+
+/* ── Copy / Quick Replies ── */
+function copyText(text,btn){
+  const done=()=>{if(btn){const p=btn.textContent;btn.textContent='Copied!';btn.classList.add('copied');setTimeout(()=>{btn.textContent=p;btn.classList.remove('copied')},1400)}toast('Copied')};
+  if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(text).then(done).catch(()=>fallback(text,done));
+  else fallback(text,done);
+}
+function fallback(text,done){const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done()}catch(e){toast('Copy failed')}ta.remove()}
+function filledReply(q){const me=getMyName();return me?q.text.split('[Your Name]').join(me):q.text}
+function renderLibrary(){
+  const grid=document.getElementById('libGrid');grid.innerHTML='';
+  quickReplies.forEach((q,i)=>{
+    const d=document.createElement('div');d.className='lib-card';
+    d.innerHTML=`<h4><span class="lib-key">${esc(q.key)}</span><span class="lib-step">${esc(q.step)}</span><span style="color:var(--muted);font-weight:700;flex:1;min-width:0">${esc(q.title)}</span></h4><div class="code">${esc(q.text)}</div><button class="copy-btn" data-copy="${i}">Copy</button>`;
+    grid.appendChild(d);
+  });
+  const vn=document.createElement('div');vn.className='lib-card';vn.style.gridColumn='1 / -1';
+  vn.innerHTML=`<h4>📞 Breakdown Call Agenda — Step 3</h4>
+    <ol class="agenda">${CALL_AGENDA.map(a=>`<li><b>${esc(a[0])}</b> — ${esc(a[1])}</li>`).join('')}</ol>
+    <div class="agenda-rule">Rule: no price and no proposal over WhatsApp before this call. Send the proposal after it, then move the lead to <b>Proposal Sent</b>.</div>`;
+  grid.appendChild(vn);
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest&&e.target.closest('[data-copy]'); if(b){copyText(filledReply(quickReplies[+b.dataset.copy]),b);return}
+  const s=e.target.closest&&e.target.closest('#pipeline [data-st]'); if(s){e.stopPropagation();setStatusFilter(s.dataset.st)}
+});
+function copyAll(){copyText(quickReplies.map(q=>`${q.key} — ${q.title}\n${filledReply(q)}`).join('\n\n---\n\n'),document.querySelector('#panel-library .btn-sm'))}
+
+/* ── Tabs & modals ── */
+function switchTab(n){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===n));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+n));
+  document.querySelectorAll('.bnav-item').forEach(b=>b.classList.toggle('active',b.dataset.bnav===n));
+  if(n==='daily')renderDaily();if(n==='metrics')updateStats();if(n==='library')renderLibrary();if(n==='leads')renderLeads();if(n==='followups')renderFollowups();
+  window.scrollTo({top:0,behavior:'smooth'});
+  if(window.innerWidth>640) toast('→ '+n);
+}
+function openAddLead(){document.getElementById('addLeadModal').classList.add('open');document.getElementById('nlBusiness').focus()}
+function closeAddLead(){document.getElementById('addLeadModal').classList.remove('open')}
+function confirmAddLead(){
+  const v=id=>document.getElementById(id).value.trim();
+  const name=v('nlBusiness'); if(!name){toast('Business name required');return}
+  const phone=v('nlPhone');
+  const dupe=leads.find(l=>l.business.toLowerCase()===name.toLowerCase()||(phone&&waLink(phone)&&waLink(l.phone)===waLink(phone)));
+  if(dupe&&!confirm(`"${dupe.business}" is already in your pipeline (#${String(dupe.id).padStart(2,'0')}). Add anyway?`))return;
+  const id=leads.length?Math.max(...leads.map(l=>l.id))+1:1;
+  leads.push(normalizeLead({id,business:name,contact:v('nlContact'),niche:v('nlNiche')||'General',city:v('nlCity')||'North West',phone:phone||'—',website:v('nlWebsite'),leak:v('nlLeak'),priority:document.getElementById('nlPriority').value,status:'New Lead',reached:0,lastContact:'',nextAction:v('nlNextAction')||STAGES[0].action,nextDate:document.getElementById('nlNextDate').value||localISODate(),revenue:0,created:localISODate()}));
+  save();renderLeads();closeAddLead();
+  ['nlBusiness','nlContact','nlCity','nlPhone','nlNiche','nlWebsite','nlLeak'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('nlNextAction').value=STAGES[0].action;document.getElementById('nlPriority').value='HOT';document.getElementById('nlNextDate').value=localISODate();
+  switchTab('leads');toast('✅ Added '+name+' — Step 1: New Lead');
+}
+function openDetail(t,h,a){document.getElementById('detailTitle').textContent=t;document.getElementById('detailBody').innerHTML=h;document.getElementById('detailActionBtn').textContent=a||'Got it';document.getElementById('detailModal').classList.add('open')}
+function closeDetail(){document.getElementById('detailModal').classList.remove('open')}
+function viewCall(id){
+  const l=leads.find(x=>x.id===id); if(!l)return;
+  const wa=waHrefForLead(l),hasWA=hasWhatsApp(l),stg=stageOf(l);
+  openDetail('📄 Call brief — '+l.business,`
+    <div style="display:grid;gap:12px;overflow-wrap:anywhere">
+      <div style="background:#0A1430;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;line-height:1.7">
+        <div><b>Stage:</b> ${stg?'Step '+stg.n+' — ':''}${esc(l.status)}</div>
+        <div><b>Niche / City:</b> ${esc(l.niche)} • ${esc(l.city)}</div>
+        <div><b>Contact:</b> ${esc(l.contact||'—')} • ${esc(l.phone)}</div>
+        ${l.website?`<div><b>Website:</b> <a href="${esc(safeUrl(l.website))}" target="_blank" rel="noopener" style="color:#7DD3FC">${esc(l.website)}</a></div>`:'<div><b>Website:</b> none on file</div>'}
+        <div><b>Leak found:</b> ${esc(l.leak||'— not recorded yet')}</div>
+        ${l.lostReason?`<div><b>Lost because:</b> ${esc(l.lostReason)}</div>`:''}
+      </div>
+      <div style="background:rgba(132,204,22,.08);border:1px solid rgba(132,204,22,.22);border-radius:10px;padding:12px">
+        <div style="font-weight:900;font-size:12px">Breakdown call agenda</div>
+        <ol class="agenda" style="margin-top:6px">${CALL_AGENDA.map(a=>`<li><b>${esc(a[0])}</b> — ${esc(a[1])}</li>`).join('')}</ol>
+      </div>
+      <div class="field"><label>Call notes (saved on this device & synced)</label>
+        <textarea id="callNotes" rows="4" placeholder="Their goals, budget signals, objections, what they agreed to…" onchange="updateField(${l.id},'notes',this.value)">${esc(l.notes)}</textarea></div>
+    </div>`,hasWA?'Open WhatsApp':'Close');
+  document.getElementById('detailActionBtn').onclick=hasWA?()=>{window.open(wa,'_blank');closeDetail()}:closeDetail;
+}
+function viewProposal(id){
+  const l=leads.find(x=>x.id===id); if(!l)return;
+  const wa=waHrefForLead(l),hasWA=hasWhatsApp(l);
+  const ready=(l.reached||0)>=2||l.status==='WON';
+  openDetail('💰 Proposal — '+l.business,`
+    <div style="display:grid;gap:10px;overflow-wrap:anywhere">
+      <div style="background:${ready?'rgba(132,204,22,.08)':'rgba(245,158,11,.10)'};border:1px solid ${ready?'rgba(132,204,22,.22)':'rgba(245,158,11,.25)'};border-radius:10px;padding:12px">
+        <div style="font-weight:900;font-size:12px">${ready?'✅ Call stage reached — you can send the proposal':'⚠ Not yet — hold the breakdown call first'}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.6">The proposal follows the call, never replaces it. Send it right after the call while the conversation is fresh.</div>
+      </div>
+      <div style="background:#0A1430;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:11px;line-height:1.7;color:var(--muted)">
+        <div style="font-weight:900;color:var(--text);font-size:12px">What to attach</div>
+        <div>• Written proposal PDF built from what you agreed on the call (scope • timeline • investment • terms)</div>
+        <div>• Use your <b style="color:#FDE68A">current</b> price list — never reuse an old version</div>
+        <div>• Then: status → <b style="color:var(--text)">Proposal Sent</b> (follow-up auto-set for +2 days)</div>
+      </div>
+    </div>`,'Mark Proposal Sent');
+  document.getElementById('detailActionBtn').onclick=()=>{closeDetail();if(l.status!=='Proposal Sent'&&l.status!=='WON')updateStatus(l.id,'Proposal Sent')};
+}
+
+/* ── Backup ── */
+function exportData(){const s=JSON.stringify({leads,daily,exportedAt:new Date().toISOString()},null,2),b=new Blob([s],{type:'application/json'}),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='nw-digitals-backup-'+localISODate()+'.json';a.click();URL.revokeObjectURL(u);toast('⬇ Exported '+leads.length+' leads')}
+function importData(){document.getElementById('importFile').click()}
+function handleImport(e){const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);if(d.leads)leads=normalizeLeads(d.leads);if(d.daily)daily=normalizeDaily(d.daily);save();renderLeads();renderDaily();renderLibrary();toast('⬆ Imported '+leads.length+' leads')}catch{toast('Import failed')}};r.readAsText(f);e.target.value=''}
+function hardReset(){if(confirm('Clear every lead and return to zero? (Daily activity is kept.)')){leads=[];localStorage.setItem('nw_leads_reset_at',String(Date.now()));save();renderLeads();renderLibrary();toast('↺ Leads cleared — zero leads')}}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeAddLead();closeDetail()} if(e.key==='n'&&(e.ctrlKey||e.metaKey)){e.preventDefault();openAddLead()}});
+document.getElementById('dailyDate').valueAsDate=new Date();document.getElementById('nlNextDate').value=localISODate();
+updateStats();renderLeads();renderLibrary();renderDaily();
+if(window.__migrationNote) setTimeout(()=>toast(window.__migrationNote),1200);
